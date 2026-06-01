@@ -1,12 +1,5 @@
-<<<<<<< HEAD
-# universal-media-converter
 Universal Media Converter. Converts all video, image and audio types. Written in Python
 =======
-# Universal Media Converter
-**Developer:** Avkila
-**Status:** Tested / Working
-**Version:** 1.1 — June 2026
-
 ---
 
 ### 🎬 Supported Formats
