@@ -1,8 +1,4 @@
 # Universal Media Converter
-**Developer:** Avkila
-**Status:** Tested / Working
-**Version:** 1.2 — June 2026
-
 ---
 
 ### 🎬 Supported Formats
