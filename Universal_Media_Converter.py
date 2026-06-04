@@ -8,17 +8,116 @@ import time
 import customtkinter as ctk
 from tkinter import messagebox, colorchooser, filedialog
 
+try:
+    from PIL import Image as PilImage
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILLOW_AVAILABLE = False
+
 FORMATS = {
-    "VIDEO": ["MP4", "MKV", "AVI", "MOV", "FLV", "WEBM", "WMV", "3GP", "MPEG", "TS", "OGV", "M4V"],
-    "AUDIO": ["MP3", "M4A", "FLAC", "WAV", "WMA", "AAC", "OGG", "OPUS", "AMR", "AIFF", "M4R"],
-    "IMAGE": ["PNG", "JPG", "JPEG", "WEBP", "BMP", "TIFF", "GIF", "ICO"]
+    "VIDEO": [
+        "MP4", "MKV", "AVI", "MOV", "FLV", "WEBM", "WMV", "3GP", "MPEG",
+        "TS",  "OGV", "M4V", "VOB", "MPG", "M2TS", "MXF", "ASF", "DV",
+        "F4V", "RM",
+    ],
+    "AUDIO": [
+        "MP3", "M4A", "FLAC", "WAV",  "WMA",  "AAC",  "OGG",  "OPUS",
+        "AMR", "AIFF","M4R",  "AC3",  "DTS",  "MKA",  "AU",   "MP2",
+        "WV",  "CAF",
+    ],
+    "IMAGE": [
+        "PNG",  "JPG",  "JPEG", "WEBP", "BMP",  "TIFF", "GIF",  "ICO",
+        "TGA",  "PCX",  "PPM",  "PGM",  "PBM",  "XBM",  "SGI",  "EPS",
+        "ICNS", "QOI",  "DDS",  "AVIF",
+    ],
+}
+
+PILLOW_FORMAT_MAP = {
+    "JPG":  "JPEG",
+    "TIF":  "TIFF",
+    "PGM":  "PPM",
+    "PBM":  "PPM",
 }
 
 BLOCKED_EXTS = {".py", ".exe", ".bat", ".dll"}
 
+# Screen height below which the format list switches to a scrollable panel
+SCROLL_THRESHOLD = 768
+
+CHANGELOG = """\
+v1.2  —  3.06.2026
+───────────────────────────────────────────
+  + Expanded video support to 20 formats
+  + Expanded audio support to 18 formats
+  + Expanded image support to 20 formats
+      (Pillow backend, separate from FFmpeg)
+  + AVX toggle in Settings
+      Disables AVX/AVX2 SIMD in the FFmpeg
+      encoder for unstable or thermal-limited
+      CPUs via -cpuflags -avx
+  + Adaptive format selector
+      Switches to a scrollable list on screens
+      shorter than 768px
+  + Changelog tab
+
+  VIDEO  (FFmpeg)  20 formats
+    Supported : MP4, MKV, AVI, MOV, FLV,
+                WEBM, WMV, 3GP, MPEG, TS,
+                OGV, M4V, VOB, MPG, M2TS,
+                MXF, ASF, DV, F4V, RM
+    Not supported : RMVB (RealMedia Variable
+                Bitrate — proprietary, no
+                open encoder available)
+
+  AUDIO  (FFmpeg)  18 formats
+    Supported : MP3, M4A, FLAC, WAV, WMA,
+                AAC, OGG, OPUS, AMR, AIFF,
+                M4R, AC3, DTS, MKA, AU,
+                MP2, WV, CAF
+    Not supported : APE (Monkey's Audio —
+                FFmpeg can decode but not
+                encode), DSF/DSD (no FFmpeg
+                encoder)
+
+  IMAGE  (Pillow)  20 formats
+    Supported : PNG, JPG/JPEG, WEBP, BMP,
+                TIFF, GIF, ICO, TGA, PCX,
+                PPM, PGM, PBM, XBM, SGI,
+                EPS, ICNS, QOI, DDS, AVIF
+    Not supported : PSD (Photoshop — Pillow
+                can read but not write),
+                RAW/CR2/NEF (camera raw —
+                no encoder), SVG (vector,
+                not raster)
+    Note : AVIF requires Python 3.9+.
+           On Python 3.8 remove AVIF from
+           the FORMATS list before compiling.
+
+───────────────────────────────────────────
+v1.1  —  1.06.2026
+───────────────────────────────────────────
+  + Thread allocation slider
+  + AVX was not yet present
+  + Fixed -threads flag placement
+      Was before -i (demuxer side, ignored).
+      Moved to output side to correctly cap
+      the encoder thread pool.
+  + Time remaining display in progress bar
+
+───────────────────────────────────────────
+v1.0  —  initial release
+───────────────────────────────────────────
+  + Core conversion (video, audio, images)
+  + Windows Explorer right-click integration
+  + Theme engine (presets + per-element picker)
+  + Real-time progress bar
+"""
+
+
 def resource_path(relative_path):
     base = getattr(sys, "_MEIPASS", os.path.abspath("."))
     return os.path.join(base, relative_path)
+
 
 def parse_time(time_str):
     h, m, s = time_str.split(":")
@@ -34,8 +133,7 @@ class UniversalConverterApp(ctk.CTk):
             if os.path.splitext(input_file)[1].lower() not in BLOCKED_EXTS:
                 self.input_file = input_file
 
-        self.title("Universal Media Converter v1.1")
-        self.geometry("560x620")
+        self.title("Universal Media Converter v1.2")
         self.resizable(False, False)
         self.attributes("-topmost", True)
 
@@ -43,25 +141,39 @@ class UniversalConverterApp(ctk.CTk):
         self.allocated_threads = max(4, self.max_threads // 2) if self.max_threads > 4 else self.max_threads
 
         self.current_process = None
-        self.is_cancelled = False
+        self.is_cancelled     = False
+        self.avx_enabled      = True
 
         self.theme_buttons = []
-        self.theme_labels = []
+        self.theme_labels  = []
+
+        # Detect screen height once before any widget is drawn
+        self.update_idletasks()
+        self._use_scroll_list = self.winfo_screenheight() < SCROLL_THRESHOLD
+
+        # Shared variable — keeps get/set interface identical regardless of widget mode
+        self._format_var = ctk.StringVar(value="")
 
         icon_path = resource_path("icon.ico")
         if os.path.exists(icon_path):
             self.iconbitmap(icon_path)
 
-        self.tabview = ctk.CTkTabview(self, width=530, height=580)
+        # Taller window when using scrollable list to give the panel breathing room
+        h = 680 if self._use_scroll_list else 640
+        self.geometry(f"560x{h}")
+
+        self.tabview = ctk.CTkTabview(self, width=530, height=h - 40)
         self.tabview.pack(padx=15, pady=10)
 
         self.tab_converter = self.tabview.add("Converter")
-        self.tab_themes   = self.tabview.add("Themes")
-        self.tab_settings = self.tabview.add("⚙ Settings")
-        self.tab_credits  = self.tabview.add("Credits")
+        self.tab_themes    = self.tabview.add("Themes")
+        self.tab_changelog = self.tabview.add("Changelog")
+        self.tab_settings  = self.tabview.add("⚙ Settings")
+        self.tab_credits   = self.tabview.add("Credits")
 
         self._build_converter_tab()
         self._build_themes_tab()
+        self._build_changelog_tab()
         self._build_settings_tab()
         self._build_credits_tab()
 
@@ -85,8 +197,21 @@ class UniversalConverterApp(ctk.CTk):
         lbl_format.pack(pady=(15, 0))
         self.theme_labels.append(lbl_format)
 
-        self.format_dropdown = ctk.CTkComboBox(self.tab_converter, width=260)
-        self.format_dropdown.pack(pady=10)
+        if self._use_scroll_list:
+            # Scrollable radio-button list — used on small screens
+            self._scroll_frame = ctk.CTkScrollableFrame(
+                self.tab_converter, width=240, height=130, label_text=""
+            )
+            self._scroll_frame.pack(pady=6)
+            self._radio_buttons = []  # rebuilt each time formats change
+            # format_dropdown shim: expose .get() / .configure() so the rest of the
+            # code never needs to know which widget is active
+            self.format_dropdown = _ScrollListShim(self._format_var, self._scroll_frame, self._radio_buttons)
+        else:
+            self.format_dropdown = ctk.CTkComboBox(
+                self.tab_converter, width=260, variable=self._format_var
+            )
+            self.format_dropdown.pack(pady=10)
 
         self.progress_bar = ctk.CTkProgressBar(self.tab_converter, width=380)
         self.progress_bar.pack(pady=25)
@@ -106,7 +231,6 @@ class UniversalConverterApp(ctk.CTk):
         self.convert_btn.pack(side="left", padx=10)
         self.theme_buttons.append(self.convert_btn)
 
-        # Cancel stays red — intentionally excluded from the theme engine
         self.cancel_btn = ctk.CTkButton(
             action_frame, text="Cancel", command=self.cancel_conversion,
             width=100, height=40, fg_color="#b82323", hover_color="#8a1a1a",
@@ -137,12 +261,12 @@ class UniversalConverterApp(ctk.CTk):
         self.theme_labels.append(lbl_custom)
 
         paint_options = [
-            ("App Background",      "bg"),
-            ("Panel / Tab Color",   "panel"),
-            ("Standard Buttons",    "buttons"),
-            ("Progress & Sliders",  "progress_fill"),
-            ("Tracks & Grooves",    "progress_track"),
-            ("Text Elements",       "text"),
+            ("App Background",     "bg"),
+            ("Panel / Tab Color",  "panel"),
+            ("Standard Buttons",   "buttons"),
+            ("Progress & Sliders", "progress_fill"),
+            ("Tracks & Grooves",   "progress_track"),
+            ("Text Elements",      "text"),
         ]
         for label, key in paint_options:
             ctk.CTkButton(
@@ -150,12 +274,20 @@ class UniversalConverterApp(ctk.CTk):
                 command=lambda k=key: self.pick_element_color(k)
             ).pack(pady=4)
 
+    def _build_changelog_tab(self):
+        box = ctk.CTkTextbox(
+            self.tab_changelog, width=490, height=490,
+            font=("Courier New", 11), wrap="none"
+        )
+        box.pack(padx=10, pady=10)
+        box.insert("end", CHANGELOG)
+        box.configure(state="disabled")
+
     def _build_settings_tab(self):
         lbl = ctk.CTkLabel(self.tab_settings, text="Windows Explorer Integration", font=("Arial", 12, "bold"))
         lbl.pack(pady=10)
         self.theme_labels.append(lbl)
 
-        # Semantic colors kept outside the theme engine
         ctk.CTkButton(
             self.tab_settings, text="Enable Right-Click Integration",
             width=280, height=35, fg_color="#1e8a3a", hover_color="#145c26",
@@ -189,6 +321,22 @@ class UniversalConverterApp(ctk.CTk):
         self.thread_slider.pack(pady=5)
         self.thread_slider.set(self.allocated_threads)
 
+        self.avx_var = ctk.BooleanVar(value=True)
+        self.avx_checkbox = ctk.CTkCheckBox(
+            self.tab_settings,
+            text="Enable AVX acceleration",
+            variable=self.avx_var,
+            command=self._toggle_avx,
+            font=("Arial", 11)
+        )
+        self.avx_checkbox.pack(pady=(10, 2))
+
+        ctk.CTkLabel(
+            self.tab_settings,
+            text="Disable if your CPU runs hot or unstable under AVX loads.",
+            font=("Arial", 9), text_color="#888888"
+        ).pack(pady=(0, 8))
+
         note_frame = ctk.CTkFrame(self.tab_settings, width=460, fg_color="#141414", corner_radius=6)
         note_frame.pack(pady=10, padx=10, fill="x")
         ctk.CTkLabel(
@@ -199,13 +347,13 @@ class UniversalConverterApp(ctk.CTk):
         ).pack(pady=12, padx=12)
 
     def _build_credits_tab(self):
-        lbl_title = ctk.CTkLabel(self.tab_credits, text="Universal Media Converter v1.1", font=("Arial", 14, "bold"))
+        lbl_title = ctk.CTkLabel(self.tab_credits, text="Universal Media Converter v1.2", font=("Arial", 14, "bold"))
         lbl_title.pack(pady=25)
         self.theme_labels.append(lbl_title)
 
         lbl_body = ctk.CTkLabel(
             self.tab_credits,
-            text="developed by avkila\n\ngithub : avkila-tech\ndiscord : avkila\n\n1.06.2026  v1.1",
+            text="developed by avkila\n\ngithub : avkila-tech\ndiscord : avkila\n\n3.06.2026  v1.2",
             font=("Arial", 12), justify="center"
         )
         lbl_body.pack(pady=10)
@@ -223,22 +371,24 @@ class UniversalConverterApp(ctk.CTk):
         if not self.input_file:
             self.source_label.configure(text="No file selected.")
             self.format_dropdown.configure(values=[])
-            self.format_dropdown.set("")
+            self._format_var.set("")
             return
 
         self.source_label.configure(text=f"Source: {os.path.basename(self.input_file)}")
         ext = os.path.splitext(self.input_file)[1].lstrip(".").upper()
 
         if ext in FORMATS["IMAGE"]:
-            self.format_dropdown.configure(values=FORMATS["IMAGE"])
-            self.format_dropdown.set("JPG" if ext != "JPG" else "PNG")
+            values = FORMATS["IMAGE"]
+            default = "JPG" if ext != "JPG" else "PNG"
         elif ext in FORMATS["AUDIO"]:
-            self.format_dropdown.configure(values=FORMATS["AUDIO"])
-            self.format_dropdown.set("MP3" if ext != "MP3" else "WAV")
+            values = FORMATS["AUDIO"]
+            default = "MP3" if ext != "MP3" else "WAV"
         else:
-            options = FORMATS["VIDEO"] + ["--- AUDIO EXTRACT ---"] + FORMATS["AUDIO"]
-            self.format_dropdown.configure(values=options)
-            self.format_dropdown.set("MP4" if ext != "MP4" else "MKV")
+            values = FORMATS["VIDEO"] + ["--- AUDIO EXTRACT ---"] + FORMATS["AUDIO"]
+            default = "MP4" if ext != "MP4" else "MKV"
+
+        self.format_dropdown.configure(values=values)
+        self._format_var.set(default)
 
     # ── THEME ENGINE ───────────────────────────────────────────────────────────
 
@@ -304,6 +454,9 @@ class UniversalConverterApp(ctk.CTk):
         self.allocated_threads = int(value)
         self.thread_label.configure(text=f"Thread Allocation: {self.allocated_threads} / {self.max_threads}")
 
+    def _toggle_avx(self):
+        self.avx_enabled = self.avx_var.get()
+
     def registry_install(self):
         if getattr(sys, "frozen", False):
             exe_path = f'"{sys.executable}"'
@@ -354,9 +507,24 @@ class UniversalConverterApp(ctk.CTk):
             messagebox.showwarning("No File", "Please select a file first.")
             return
 
-        choice = self.format_dropdown.get()
-        if "AUDIO EXTRACT" in choice:
+        choice = self._format_var.get()
+        if not choice or "AUDIO EXTRACT" in choice:
             messagebox.showwarning("Invalid Selection", "Select a target audio format below the separator.")
+            return
+
+        src_ext = os.path.splitext(self.input_file)[1].lstrip(".").upper()
+        if src_ext in FORMATS["IMAGE"] or choice in FORMATS["IMAGE"]:
+            if not PILLOW_AVAILABLE:
+                messagebox.showerror(
+                    "Pillow Not Installed",
+                    "Image conversion requires Pillow.\n\nInstall it with:\n  pip install Pillow"
+                )
+                return
+            self.is_cancelled = False
+            self._set_running(True)
+            self.progress_bar.set(0)
+            self.status_label.configure(text="Converting...", text_color="white")
+            threading.Thread(target=self._run_pillow_worker, args=(choice,), daemon=True).start()
             return
 
         self.is_cancelled = False
@@ -364,32 +532,50 @@ class UniversalConverterApp(ctk.CTk):
         self.progress_bar.set(0)
         self.status_label.configure(text="Starting...", text_color="white")
 
-        base, src_ext = os.path.splitext(self.input_file)
+        base, src_ext_raw = os.path.splitext(self.input_file)
         output_file = f"{base}_converted.{choice.lower()}"
 
-        # -threads and -thread_type must be output-side flags to control the encoder.
-        # Placing them before -i only affects the demuxer, which ignores them for CPU work.
-        # -filter_threads controls the filtergraph thread pool separately.
         t = str(self.allocated_threads)
         ffmpeg_args = ["ffmpeg", "-y", "-i", self.input_file]
 
-        # Strip video stream when extracting audio from a video file
-        if src_ext.lstrip(".").upper() in FORMATS["VIDEO"] and choice in FORMATS["AUDIO"]:
+        if src_ext_raw.lstrip(".").upper() in FORMATS["VIDEO"] and choice in FORMATS["AUDIO"]:
             ffmpeg_args += ["-vn"]
 
         ffmpeg_args += [
             "-threads", t,
             "-filter_threads", t,
             "-thread_type", "slice+frame",
-            output_file,
         ]
 
-        threading.Thread(target=self._run_worker, args=(ffmpeg_args,), daemon=True).start()
+        if not self.avx_enabled:
+            ffmpeg_args += ["-cpuflags", "-avx"]
 
-    def _run_worker(self, ffmpeg_args):
+        ffmpeg_args.append(output_file)
+
+        threading.Thread(target=self._run_ffmpeg_worker, args=(ffmpeg_args,), daemon=True).start()
+
+    def _run_pillow_worker(self, target_fmt):
+        try:
+            base = os.path.splitext(self.input_file)[0]
+            output_file = f"{base}_converted.{target_fmt.lower()}"
+            pil_fmt = PILLOW_FORMAT_MAP.get(target_fmt, target_fmt)
+            img = PilImage.open(self.input_file)
+            if pil_fmt in ("JPEG", "BMP", "EPS", "PPM") and img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGB")
+            img.save(output_file, format=pil_fmt)
+            self.progress_bar.set(1.0)
+            self.status_label.configure(text="Done", text_color="green")
+            messagebox.showinfo("Done", "Conversion complete.\nFile saved to the source folder.")
+        except Exception as e:
+            self.status_label.configure(text="Error", text_color="red")
+            messagebox.showerror("Conversion Failed", str(e))
+        finally:
+            self._set_running(False)
+
+    def _run_ffmpeg_worker(self, ffmpeg_args):
         duration_re = re.compile(r"Duration: (\d{2}:\d{2}:\d{2}\.\d{2})")
         time_re     = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d{2})")
-        total = 0.0
+        total      = 0.0
         start_wall = None
 
         try:
@@ -411,7 +597,7 @@ class UniversalConverterApp(ctk.CTk):
 
                 m = time_re.search(line)
                 if m and total > 0:
-                    current = parse_time(m.group(1))
+                    current  = parse_time(m.group(1))
                     progress = current / total
 
                     if start_wall is None:
@@ -444,6 +630,47 @@ class UniversalConverterApp(ctk.CTk):
                 self.progress_bar.set(1.0)
                 self.status_label.configure(text="Done", text_color="green")
                 messagebox.showinfo("Done", "Conversion complete.\nFile saved to the source folder.")
+
+
+
+
+class _ScrollListShim:
+    def __init__(self, var, frame, radio_list):
+        self._var    = var
+        self._frame  = frame
+        self._radios = radio_list
+        self._state  = "normal"
+
+    def get(self):
+        return self._var.get()
+
+    def configure(self, **kwargs):
+        if "values" in kwargs:
+            self._rebuild(kwargs["values"])
+        if "state" in kwargs:
+            self._state = kwargs["state"]
+            for rb in self._radios:
+                rb.configure(state=self._state)
+
+    def _rebuild(self, values):
+        for rb in self._radios:
+            rb.destroy()
+        self._radios.clear()
+        for v in values:
+            if v.startswith("---"):
+                # Separator label — not selectable
+                ctk.CTkLabel(
+                    self._frame, text=v,
+                    font=("Arial", 9), text_color="#666666"
+                ).pack(anchor="w", padx=8, pady=(4, 2))
+            else:
+                rb = ctk.CTkRadioButton(
+                    self._frame, text=v,
+                    variable=self._var, value=v,
+                    font=("Arial", 11)
+                )
+                rb.pack(anchor="w", padx=8, pady=1)
+                self._radios.append(rb)
 
 
 if __name__ == "__main__":
